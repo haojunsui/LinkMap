@@ -55,7 +55,7 @@
     panel.canChooseFiles = YES;
     
     [panel beginWithCompletionHandler:^(NSInteger result){
-        if (result == NSFileHandlingPanelOKButton) {
+        if (result == NSModalResponseOK) {
             NSURL *document = [[panel URLs] objectAtIndex:0];
             _filePathField.stringValue = document.path;
             self.linkMapFileURL = document;
@@ -69,6 +69,7 @@
         return;
     }
     
+    NSString *searchKey = _searchField.stringValue;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSString *content = [NSString stringWithContentsOfURL:_linkMapFileURL encoding:NSMacOSRomanStringEncoding error:nil];
         
@@ -89,6 +90,7 @@
         
         NSArray <SymbolModel *>*symbols = [symbolMap allValues];
         
+        
         NSArray *sortedSymbols = [self sortSymbols:symbols];
         
         __block NSControlStateValue groupButtonState;
@@ -97,7 +99,7 @@
         });
         
         if (1 == groupButtonState) {
-            [self buildCombinationResultWithSymbols:sortedSymbols];
+            [self buildCombinationResultWithSymbols:sortedSymbols withSearchKey:searchKey];
         } else {
             [self buildResultWithSymbols:sortedSymbols];
         }
@@ -114,47 +116,43 @@
 - (NSMutableDictionary *)symbolMapFromContent:(NSString *)content {
     NSMutableDictionary <NSString *,SymbolModel *>*symbolMap = [NSMutableDictionary new];
     // 符号文件列表
-    NSArray *lines = [content componentsSeparatedByString:@"\n"];
+    NSRegularExpression *regexLinkmapObjectFiles = [NSRegularExpression
+        regularExpressionWithPattern:@"\\[(\\d+)\\]\\s\\/(.+)"
+                             options:0
+                               error:nil];
+    [regexLinkmapObjectFiles enumerateMatchesInString:content
+                                              options:0
+                                                range:NSMakeRange(0, [content length])
+                                           usingBlock:^(NSTextCheckingResult *_Nullable result, __unused NSMatchingFlags flags, __unused BOOL *_Nonnull stop) {
+        if ([result numberOfRanges] != 3)
+            return;
+        
+        SymbolModel *symbol = [SymbolModel new];
+        NSString *key = [content substringWithRange:[result rangeAtIndex:1]];
+        symbol.file = [content substringWithRange:[result rangeAtIndex:2]];
+        symbolMap[key] = symbol;
+    }];
     
-    BOOL reachFiles = NO;
-    BOOL reachSymbols = NO;
-    BOOL reachSections = NO;
-    
-    for(NSString *line in lines) {
-        if([line hasPrefix:@"#"]) {
-            if([line hasPrefix:@"# Object files:"])
-                reachFiles = YES;
-            else if ([line hasPrefix:@"# Sections:"])
-                reachSections = YES;
-            else if ([line hasPrefix:@"# Symbols:"])
-                reachSymbols = YES;
-        } else {
-            if(reachFiles == YES && reachSections == NO && reachSymbols == NO) {
-                NSRange range = [line rangeOfString:@"]"];
-                if(range.location != NSNotFound) {
-                    SymbolModel *symbol = [SymbolModel new];
-                    symbol.file = [line substringFromIndex:range.location+1];
-                    NSString *key = [line substringToIndex:range.location+1];
-                    symbolMap[key] = symbol;
-                }
-            } else if (reachFiles == YES && reachSections == YES && reachSymbols == YES) {
-                NSArray <NSString *>*symbolsArray = [line componentsSeparatedByString:@"\t"];
-                if(symbolsArray.count == 3) {
-                    NSString *fileKeyAndName = symbolsArray[2];
-                    NSUInteger size = strtoul([symbolsArray[1] UTF8String], nil, 16);
-                    
-                    NSRange range = [fileKeyAndName rangeOfString:@"]"];
-                    if(range.location != NSNotFound) {
-                        NSString *key = [fileKeyAndName substringToIndex:range.location+1];
-                        SymbolModel *symbol = symbolMap[key];
-                        if(symbol) {
-                            symbol.size += size;
-                        }
-                    }
-                }
-            }
+    NSRegularExpression *regexLinkmapSymbol = [NSRegularExpression
+        regularExpressionWithPattern:@"0x[A-F\\d]*\\s+(0x[A-F\\d]*)\\s+\\[(.*)\\]\\s(.+)"
+                             options:0
+                               error:nil];
+    [regexLinkmapSymbol enumerateMatchesInString:content
+                                         options:0
+                                           range:NSMakeRange(0, [content length])
+                                      usingBlock:^(NSTextCheckingResult *_Nullable result, __unused NSMatchingFlags flags, __unused BOOL *_Nonnull stop) {
+        if ([result numberOfRanges] != 4)
+            return;
+        
+        NSUInteger size = strtoul([[content substringWithRange:[result rangeAtIndex:1]] UTF8String], nil, 16);
+        
+        NSString *key = [content substringWithRange:[result rangeAtIndex:2]];
+        SymbolModel *symbol = symbolMap[key];
+        if(symbol) {
+            symbol.size += size;
         }
-    }
+    }];
+
     return symbolMap;
 }
 
@@ -194,11 +192,11 @@
         }
     }
     
-    [_result appendFormat:@"\r\n总大小: %.2fM\r\n",(totalSize/1024.0/1024.0)];
+    [_result appendFormat:@"\r\n总大小: %.2fM\r\n",(totalSize/1000.0/1000.0)];
 }
 
 
-- (void)buildCombinationResultWithSymbols:(NSArray *)symbols {
+- (void)buildCombinationResultWithSymbols:(NSArray *)symbols withSearchKey:(NSString *)searchKey{
     self.result = [@"库大小\t库名称\r\n\r\n" mutableCopy];
     NSUInteger totalSize = 0;
     
@@ -208,8 +206,15 @@
         NSString *name = [[symbol.file componentsSeparatedByString:@"/"] lastObject];
         if ([name hasSuffix:@")"] &&
             [name containsString:@"("]) {
+            
             NSRange range = [name rangeOfString:@"("];
             NSString *component = [name substringToIndex:range.location];
+            
+            NSRange begin = [component rangeOfString:@"["];
+            NSRange end = [component rangeOfString:@"]" options:NSBackwardsSearch];
+            if (begin.location != NSNotFound && end.location != NSNotFound && end.location > begin.location) {
+                component = [component stringByReplacingCharactersInRange:NSMakeRange(begin.location, end.location-begin.location + 1) withString:@""];
+            }
             
             SymbolModel *combinationSymbol = [combinationMap objectForKey:component];
             if (!combinationSymbol) {
@@ -228,9 +233,7 @@
     NSArray <SymbolModel *>*combinationSymbols = [combinationMap allValues];
     
     NSArray *sortedSymbols = [self sortSymbols:combinationSymbols];
-    
-    NSString *searchKey = _searchField.stringValue;
-    
+        
     for(SymbolModel *symbol in sortedSymbols) {
         if (searchKey.length > 0) {
             if ([symbol.file containsString:searchKey]) {
@@ -243,7 +246,7 @@
         }
     }
     
-    [_result appendFormat:@"\r\n总大小: %.2fM\r\n",(totalSize/1024.0/1024.0)];
+    [_result appendFormat:@"\r\n总大小: %.2fM\r\n",(totalSize/1000.0/1000.0)];
 }
 
 - (IBAction)ouputFile:(id)sender {
@@ -254,7 +257,7 @@
     [panel setCanChooseFiles:NO];
     
     [panel beginWithCompletionHandler:^(NSInteger result) {
-        if (result == NSFileHandlingPanelOKButton) {
+        if (result == NSModalResponseOK) {
             NSURL*  theDoc = [[panel URLs] objectAtIndex:0];
             NSMutableString *content =[[NSMutableString alloc]initWithCapacity:0];
             [content appendString:[theDoc path]];
@@ -266,12 +269,18 @@
 
 - (void)appendResultWithSymbol:(SymbolModel *)model {
     NSString *size = nil;
-    if (model.size / 1024.0 / 1024.0 > 1) {
-        size = [NSString stringWithFormat:@"%.2fM", model.size / 1024.0 / 1024.0];
+    if (model.size / 1000.0 / 1000.0 > 1) {
+        size = [NSString stringWithFormat:@"%.2fM", model.size / 1000.0 / 1000.0];
     } else {
-        size = [NSString stringWithFormat:@"%.2fK", model.size / 1024.0];
+        size = [NSString stringWithFormat:@"%.2fK", model.size / 1000.0];
     }
-    [_result appendFormat:@"%@\t%@\r\n",size, [[model.file componentsSeparatedByString:@"/"] lastObject]];
+    NSString *fileName = [[model.file componentsSeparatedByString:@"/"] lastObject];
+    NSRange begin = [fileName rangeOfString:@"["];
+    NSRange end = [fileName rangeOfString:@"]" options:NSBackwardsSearch];
+    if (begin.location != NSNotFound && end.location != NSNotFound && end.location > begin.location) {
+        fileName = [fileName stringByReplacingCharactersInRange:NSMakeRange(begin.location, end.location-begin.location + 1) withString:@""];
+    }
+    [_result appendFormat:@"%@\t%@\r\n",size, fileName];
 }
 
 - (BOOL)checkContent:(NSString *)content {
